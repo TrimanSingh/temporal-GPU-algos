@@ -121,7 +121,8 @@ void temporal_bfs(
     int num_vertices, vertex_t source, time_temporal t0,
     // Output parameters
     thrust::device_vector<time_temporal>& result_sigma,
-    thrust::device_vector<int>& result_dist
+    thrust::device_vector<int>& result_dist,
+    thrust::device_vector<int>& result_pred
 ) {
     int num_edges = d_edges.size();
     std::cout << "[temporal_bfs] Called with num_edges: " << num_edges
@@ -222,13 +223,14 @@ void temporal_bfs(
 
     result_sigma = d_sigma_current;
     result_dist = d_dist_current;
+    result_pred = d_pred_in; 
 }
 
 
 int main() {
     std::cout << "[Info] Main function started." << std::endl;
 
-    EdgeData edge_info = load_temporal_edges_from_csv("data/small_temporal_graph.csv");
+    EdgeData edge_info = load_temporal_edges_from_csv("../data/sx-stackoverflowC.csv");
     
     if (edge_info.max_vertex_id == -1 && edge_info.edges.empty()) {
         std::cerr << "Error: No valid edges loaded or file could not be processed correctly. Exiting." << std::endl;
@@ -255,7 +257,7 @@ int main() {
     thrust::device_vector<TemporalEdge> d_edges = h_edges;
     // std::cout << "[Info] Number of device edges: " << d_edges.size() << std::endl; // d_edges.size() is same as h_edges.size()
 
-    vertex_t source = 0; // Default source
+    vertex_t source = 50; // Default source
     time_temporal t0 = 0;   // Default start time
 
     if (num_vertices > 0 && (source < 0 || source >= num_vertices)) {
@@ -271,13 +273,15 @@ int main() {
 
     thrust::device_vector<time_temporal> d_final_sigma(num_vertices); // Size 0 if num_vertices is 0
     thrust::device_vector<int> d_final_dist(num_vertices);          // Size 0 if num_vertices is 0
+    thrust::device_vector<int> d_final_pred(num_vertices);
 
     std::cout << "[Info] Calling temporal_bfs..." << std::endl;
-    temporal_bfs(d_edges, num_vertices, source, t0, d_final_sigma, d_final_dist);
+    temporal_bfs(d_edges, num_vertices, source, t0, d_final_sigma, d_final_dist, d_final_pred);
     std::cout << "[Info] temporal_bfs call finished." << std::endl;
 
     thrust::host_vector<time_temporal> h_sigma_values = d_final_sigma;
     thrust::host_vector<int> h_dist_values = d_final_dist;
+    thrust::host_vector<int> h_pred_values = d_final_pred;
 
     std::cout << "[Info] Preparing to print results. Number of vertices to print: " << num_vertices << std::endl;
     std::cout << "Temporal BFS Results (source: " << source << ", t0: " << t0 << "):" << std::endl;
@@ -290,19 +294,45 @@ int main() {
 
 
     for (int i = 0; i < num_vertices; ++i) {
-        std::cout << "Vertex " << i << ": ";
+
         if (h_sigma_values[i] == INF_TIME) {
-            std::cout << "Earliest Arrival Time = Unreachable";
+            // std::cout << "Earliest Arrival Time = Unreachable";
         } else {
-            std::cout << "Earliest Arrival Time = " << h_sigma_values[i];
+            std::cout << "Vertex " << i << ": "<< "Earliest Arrival Time = " << h_sigma_values[i];
         }
         
         if (h_dist_values[i] == std::numeric_limits<int>::max()) {
-            std::cout << ", Distance = Unreachable" << std::endl;
+            // std::cout << ", Distance = Unreachable" << std::endl;
         } else {
             std::cout << ", Distance = " << h_dist_values[i] << std::endl;
         }
     }
+
+    // auto print_path = [&](int target) {
+    //     std::vector<int> path;
+    //     for (int v = target; v != -1 && v != source; v = h_pred_values[v]) {
+    //         if (v < 0 || v >= num_vertices) break; // defensive
+    //         path.push_back(v);
+    //     }
+    //     if (target == source || !path.empty()) {
+    //         path.push_back(source);
+    //         std::reverse(path.begin(), path.end());
+    //         std::cout << "Path to Vertex " << target << ": ";
+    //         for (size_t i = 0; i < path.size(); ++i) {
+    //             std::cout << path[i];
+    //             if (i + 1 < path.size()) std::cout << " -> ";
+    //         }
+    //         std::cout << std::endl;
+    //     } else {
+    //         // std::cout << "No path to Vertex " << target << " (unreachable)" << std::endl;
+    //     }
+    // };
+
+    // std::cout << "\nReconstructed Paths:" << std::endl;
+    // for (int i = 0; i < num_vertices; ++i) {
+    //     print_path(i);
+    // }
+
 
     return 0;
 }

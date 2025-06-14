@@ -7,6 +7,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <string> // Added for std::stoi/stod
 
 // ---------- Types ----------
 using vid_t = int;
@@ -217,7 +218,7 @@ __global__ void dottt_kernel(
     }
 }
 
-unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts_t delta13, ts_t delta23) {
+unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts_t delta13, ts_t delta23, int max_triangles) {
     auto order = degeneracy_order(n,edges);
     std::vector<Edge> fwd;
     orient_edges(edges, order, fwd);
@@ -244,7 +245,7 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
     thrust::device_vector<ts_t> det=et, dat=at;
     thrust::device_vector<unsigned long long> dres(1,0ULL);
 
-    int max_triangles = 10000;
+    // int max_triangles = 10000; // This line is now a parameter
     thrust::device_vector<Edge> dtri_edges(3 * max_triangles);
 
     int B=128, G=(M+B-1)/B;
@@ -263,7 +264,9 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
 
 
     thrust::host_vector<Edge> htri_edges = dtri_edges;
-    for (int i = 0; i < dres[0]; ++i) {
+
+
+    for (unsigned long long i = 0; i < dres[0]; ++i) {
         const Edge& e1 = htri_edges[3*i + 0];
         const Edge& e2 = htri_edges[3*i + 1];
         const Edge& e3 = htri_edges[3*i + 2];
@@ -279,12 +282,31 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
 
 
 // ---------- Main ----------
-int main(){
-    auto ed = load_edges("../data/bitcoinC.csv");
+int main(int argc, char* argv[]){
+    if (argc < 6) {
+        std::cerr << "Usage: " << argv[0] << " <filename> <delta12> <delta13> <delta23> <max_triangles_output (optional)>" << std::endl;
+        return 1;
+    }
+
+    std::string filename = argv[1];
+    ts_t delta12 = std::stoi(argv[2]);
+    ts_t delta13 = std::stoi(argv[3]);
+    ts_t delta23 = std::stoi(argv[4]);
+    int max_triangles_output = 10000; // Default value
+    if (argc > 5) {
+        max_triangles_output = std::stoi(argv[5]);
+    }
+
+
+    auto ed = load_edges(filename);
+    if (ed.max_vid == -1) { // Check if graph loading failed (e.g. file not found)
+        std::cerr << "Error loading graph from file: " << filename << std::endl;
+        return 1;
+    }
     int n = ed.max_vid + 1;
-    ts_t delta12 = 100;
-    ts_t delta13 = 100;
-    ts_t delta23 = 100;
-    auto count = dottt_count(ed.edges, n, delta12, delta13, delta23);
-    std::cout << "Temporal triangles (DOTTT, delta="<<delta12<<"): "<<count<<"\n";
+
+    // Pass max_triangles_output to dottt_count
+    auto count = dottt_count(ed.edges, n, delta12, delta13, delta23, max_triangles_output);
+    std::cout << "Temporal triangles (DOTTT, deltas=" << delta12 << "," << delta13 << "," << delta23 << "): " << count << "\n";
+    return 0;
 }
