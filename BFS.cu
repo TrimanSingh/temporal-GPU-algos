@@ -163,6 +163,11 @@ void temporal_bfs(
     
     std::cout << "[temporal_bfs] Starting iterations. num_blocks: " << num_blocks << ", BLOCK_SIZE: " << BLOCK_SIZE << std::endl;
 
+cudaEvent_t start, stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+
+cudaEventRecord(start);
 
     int iteration = 0;
 
@@ -219,6 +224,17 @@ void temporal_bfs(
     } while (h_changed && num_edges > 0); 
 
     cudaFree(d_changed);
+
+    // === Stop GPU timing ===
+cudaEventRecord(stop);
+cudaEventSynchronize(stop);
+float milliseconds = 0;
+cudaEventElapsedTime(&milliseconds, start, stop);
+std::cout << "[Timing] GPU BFS Time: " << milliseconds << " ms" << std::endl;
+cudaEventDestroy(start);
+cudaEventDestroy(stop);
+
+
     std::cout << "[temporal_bfs] Finished iterations. Total iterations performed: " << iteration << std::endl;
 
     result_sigma = d_sigma_current;
