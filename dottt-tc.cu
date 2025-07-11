@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <string> // Added for std::stoi/stod
+#include <cuda_runtime.h>
 
 // ---------- Types ----------
 using vid_t = int;
@@ -76,49 +77,169 @@ EdgeData load_edges(const std::string &path) {
     return ed;
 }
 
+// ---------- GPU Utilities ----------
+void printGPUInfo() {
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+    std::cout << "Available GPUs: " << deviceCount << std::endl;
+    
+    for (int dev = 0; dev < deviceCount; dev++) {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, dev);
+        
+        size_t free_mem, total_mem;
+        cudaSetDevice(dev);
+        cudaMemGetInfo(&free_mem, &total_mem);
+        
+        std::cout << "GPU " << dev << ": " << deviceProp.name 
+                  << " (Free: " << (free_mem / (1024*1024)) << " MB, "
+                  << "Total: " << (total_mem / (1024*1024)) << " MB)" << std::endl;
+    }
+}
+
+int selectBestGPU() {
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+    
+    if (deviceCount == 0) {
+        std::cerr << "No CUDA devices found!" << std::endl;
+        return -1;
+    }
+    
+    int bestDevice = 0;
+    size_t maxFreeMem = 0;
+    
+    for (int dev = 0; dev < deviceCount; dev++) {
+        size_t free_mem, total_mem;
+        cudaSetDevice(dev);
+        cudaMemGetInfo(&free_mem, &total_mem);
+        
+        if (free_mem > maxFreeMem) {
+            maxFreeMem = free_mem;
+            bestDevice = dev;
+        }
+    }
+    
+    cudaSetDevice(bestDevice);
+    std::cout << "Selected GPU " << bestDevice << " with " << (maxFreeMem / (1024*1024)) << " MB free memory" << std::endl;
+    return bestDevice;
+}
+
 // ---------- Compute Degeneracy Ordering ----------
 std::vector<vid_t> degeneracy_order(int n, const std::vector<Edge>& edges) {
     if (n == 0) {
         return std::vector<vid_t>(); // Handle empty graph case
     }
-    std::vector<std::vector<vid_t>> adj(n);
-    for (auto&e: edges) {
-        adj[e.u].push_back(e.v);
-        adj[e.v].push_back(e.u);
-    }
-    std::vector<int> deg(n);
-    for (int i = 0; i < n; i++) deg[i] = adj[i].size();
-    std::vector<std::vector<vid_t>> bucket(n+1);
-    for (int i = 0; i < n; i++) bucket[deg[i]].push_back(i);
-
-    std::vector<bool> removed(n,false);
-    std::vector<vid_t> order(n);
-    for (int k = 0; k < n; k++) {
-        int curr_deg = 0;
-        while (curr_deg <= n && bucket[curr_deg].empty()) {
-            curr_deg++;
+    
+    // Estimate memory usage
+    size_t estimated_memory = 0;
+    estimated_memory += (size_t)n * sizeof(std::vector<vid_t>); // adj list headers
+    estimated_memory += edges.size() * 2 * sizeof(vid_t); // adj list data (each edge counted twice)
+    estimated_memory += (size_t)(n + 1) * sizeof(std::vector<vid_t>); // bucket headers
+    estimated_memory += (size_t)n * sizeof(vid_t); // bucket data
+    estimated_memory += (size_t)n * sizeof(int); // degrees
+    estimated_memory += (size_t)n * sizeof(bool); // removed array
+    estimated_memory += (size_t)n * sizeof(vid_t); // order array
+    
+    std::cout << "Estimated memory usage: " << (estimated_memory / (1024*1024)) << " MB" << std::endl;
+    
+    // Check if estimated memory is too large (> 8GB)
+    // if (estimated_memory > 8ULL * 1024 * 1024 * 1024) {
+    //     std::cerr << "Error: Estimated memory usage (" << (estimated_memory / (1024*1024*1024)) 
+    //               << " GB) exceeds 8GB limit." << std::endl;
+    //     std::cerr << "Consider using a subset of the graph or a machine with more RAM." << std::endl;
+    //     throw std::runtime_error("Memory limit exceeded");
+    // }
+    
+    std::cout << "Building adjacency list for " << n << " vertices..." << std::endl;
+    
+    try {
+        std::vector<std::vector<vid_t>> adj;
+        adj.reserve(n);
+        adj.resize(n);
+        std::cout << "Allocated adjacency list. Processing " << edges.size() << " edges..." << std::endl;
+        
+        for (const auto& e : edges) {
+            if (e.u >= n || e.v >= n || e.u < 0 || e.v < 0) {
+                std::cerr << "Error: Invalid vertex ID in edge (" << e.u << "," << e.v << "). Max allowed: " << (n-1) << std::endl;
+                throw std::runtime_error("Invalid vertex ID");
+            }
+            adj[e.u].push_back(e.v);
+            adj[e.v].push_back(e.u);
+        }
+        
+        std::cout << "Computing degrees..." << std::endl;
+        std::vector<int> deg;
+        deg.reserve(n);
+        deg.resize(n);
+        for (int i = 0; i < n; i++) {
+            deg[i] = adj[i].size();
+        }
+        
+        std::cout << "Creating degree buckets..." << std::endl;
+        std::vector<std::vector<vid_t>> bucket;
+        bucket.reserve(n + 1);
+        bucket.resize(n + 1);
+        for (int i = 0; i < n; i++) {
+            if (deg[i] <= n) {
+                bucket[deg[i]].push_back(i);
+            } else {
+                std::cerr << "Error: Vertex " << i << " has degree " << deg[i] << " > n=" << n << std::endl;
+                throw std::runtime_error("Invalid degree");
+            }
         }
 
-        if (curr_deg > n) {
-            // This means all buckets bucket[0]...bucket[n] are empty.
-            // If k < n at this point, it's an error: we expected to find more vertices.
-            std::cerr << "Critical Error in degeneracy_order: All buckets exhausted prematurely.\n"
-                      << "k = " << k << ", n = " << n << ", curr_deg = " << curr_deg << std::endl;
-            // This could indicate that n is larger than the number of actual vertices
-            // or an issue in degree maintenance.
-            throw std::logic_error("Degeneracy order failed: Buckets exhausted prematurely.");
+        std::cout << "Starting degeneracy ordering..." << std::endl;
+        std::vector<bool> removed;
+        removed.reserve(n);
+        removed.resize(n, false);
+        std::vector<vid_t> order;
+        order.reserve(n);
+        order.resize(n);
+        
+        for (int k = 0; k < n; k++) {
+            // if (k % 100000 == 0) {
+            //     std::cout << "Processed " << k << "/" << n << " vertices" << std::endl;
+            // }
+            int curr_deg = 0;
+            while (curr_deg <= n && bucket[curr_deg].empty()) {
+                curr_deg++;
+            }
+
+            if (curr_deg > n) {
+                // This means all buckets bucket[0]...bucket[n] are empty.
+                // If k < n at this point, it's an error: we expected to find more vertices.
+                std::cerr << "Critical Error in degeneracy_order: All buckets exhausted prematurely.\n"
+                          << "k = " << k << ", n = " << n << ", curr_deg = " << curr_deg << std::endl;
+                // This could indicate that n is larger than the number of actual vertices
+                // or an issue in degree maintenance.
+                throw std::logic_error("Degeneracy order failed: Buckets exhausted prematurely.");
+            }
+            // Now, curr_deg <= n and bucket[curr_deg] is non-empty.
+            vid_t u = bucket[curr_deg].back();
+            bucket[curr_deg].pop_back();
+            removed[u] = true;
+            order[u] = k;
+            for (vid_t v: adj[u]) {
+                if (!removed[v]) {
+                    int old_deg = deg[v];
+                    deg[v]--;
+                    if (old_deg > 0 && old_deg <= n) {
+                        bucket[old_deg - 1].push_back(v);
+                    }
+                }
+            }
         }
-        // Now, curr_deg <= n and bucket[curr_deg] is non-empty.
-        vid_t u = bucket[curr_deg].back();
-        bucket[curr_deg].pop_back();
-        removed[u] = true;
-        order[u] = k;
-        for (vid_t v: adj[u]) if (!removed[v]) {
-            int d = deg[v]--;
-            bucket[d-1].push_back(v);
-        }
+        std::cout << "Degeneracy ordering completed." << std::endl;
+        return order;
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "Memory allocation failed in degeneracy_order: " << e.what() << std::endl;
+        std::cerr << "Graph too large for available memory" << std::endl;
+        throw;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in degeneracy_order: " << e.what() << std::endl;
+        throw;
     }
-    return order;
 }
 
 // ---------- Orient edges forward-only ----------
@@ -182,7 +303,8 @@ __global__ void dottt_kernel(
     const int* idx, const int* adj, const ts_t* at,
     ts_t delta12, ts_t delta13, ts_t delta23,
     unsigned long long *res,
-    Edge* triangle_out)
+    Edge* triangle_out,
+    size_t max_triangles_output)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= M) return;
@@ -207,18 +329,26 @@ __global__ void dottt_kernel(
         if (lo < endU && adj[lo] == w) {
             ts_t tuw = at[lo];
             if ((tuw - tuv <= delta13) && (tuw - tvw <= delta23)) {
-                // atomicAdd(res, 1ULL);
-                int pos = atomicAdd((int*)res, 1);
-                int base = 3 * pos;
-                triangle_out[base + 0] = Edge{u, v, tuv};  // edge1: u → v @ t_uv
-                triangle_out[base + 1] = Edge{u, w, tuw};  // edge2: u → w @ t_uw
-                triangle_out[base + 2] = Edge{v, w, tvw};  // edge3: v → w @ t_vw
+                unsigned long long pos = atomicAdd((unsigned long long*)res, 1ULL);
+                if (pos < max_triangles_output) {
+                    size_t base = 3 * pos;
+                    triangle_out[base + 0] = Edge{u, v, tuv};  // edge1: u → v @ t_uv
+                    triangle_out[base + 1] = Edge{u, w, tuw};  // edge2: u → w @ t_uw
+                    triangle_out[base + 2] = Edge{v, w, tvw};  // edge3: v → w @ t_vw
+                }
             }
         }
     }
 }
 
-unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts_t delta13, ts_t delta23, int max_triangles) {
+unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts_t delta13, ts_t delta23, size_t max_triangles) {
+    std::cout << "Running dottt_count for n=" << n << " vertices." << std::endl;
+    
+    // Check GPU memory before proceeding
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    std::cout << "GPU Memory: " << (free_mem / (1024*1024)) << " MB free, " << (total_mem / (1024*1024)) << " MB total" << std::endl;
+    
     auto order = degeneracy_order(n,edges);
     std::vector<Edge> fwd;
     orient_edges(edges, order, fwd);
@@ -226,10 +356,31 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
     //     std::cout << "Edge: " << e.u << " -> " << e.v << " at time " << e.t << "\n";
     // }
     int M = fwd.size();
+    std::cout << "Oriented graph has " << M << " edges." << std::endl;
 
     std::vector<int> idx, adj;
     std::vector<ts_t> at;
     build_csr(n, fwd, idx, adj, at);
+    std::cout << "CSR created. idx size: " << idx.size() << ", adj size: " << adj.size() << ", at size: " << at.size() << std::endl;
+
+    // Estimate GPU memory usage
+    size_t gpu_memory_needed = 0;
+    gpu_memory_needed += M * sizeof(int) * 2; // eu, ev
+    gpu_memory_needed += M * sizeof(ts_t); // et
+    gpu_memory_needed += (n+1) * sizeof(int); // idx
+    gpu_memory_needed += M * sizeof(int); // adj
+    gpu_memory_needed += M * sizeof(ts_t); // at
+    gpu_memory_needed += 3 * max_triangles * sizeof(Edge); // triangle output
+    gpu_memory_needed += sizeof(unsigned long long); // result counter
+    
+    std::cout << "Estimated GPU memory needed: " << (gpu_memory_needed / (1024*1024)) << " MB" << std::endl;
+    
+    if (gpu_memory_needed > free_mem) {
+        std::cerr << "Error: Not enough GPU memory! Needed: " << (gpu_memory_needed / (1024*1024)) 
+                  << " MB, Available: " << (free_mem / (1024*1024)) << " MB" << std::endl;
+        std::cerr << "Try reducing max_triangles or using a GPU with more memory." << std::endl;
+        throw std::runtime_error("Insufficient GPU memory");
+    }
 
 //     for (int u = 0; u < n; ++u) {
 //   for (int i = idx[u]; i < idx[u+1]; ++i) {
@@ -241,41 +392,56 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
     thrust::host_vector<int> eu(M), ev(M); thrust::host_vector<ts_t> et(M);
     for(int i=0;i<M;i++){ eu[i]=fwd[i].u; ev[i]=fwd[i].v; et[i]=fwd[i].t; }
 
-    thrust::device_vector<int> deu=eu, dev=ev, didx=idx, dadj=adj;
-    thrust::device_vector<ts_t> det=et, dat=at;
-    thrust::device_vector<unsigned long long> dres(1,0ULL);
+    std::cout << "Copying data to GPU..." << std::endl;
+    try {
+        thrust::device_vector<int> deu=eu, dev=ev, didx=idx, dadj=adj;
+        thrust::device_vector<ts_t> det=et, dat=at;
+        thrust::device_vector<unsigned long long> dres(1,0ULL);
 
-    // int max_triangles = 10000; // This line is now a parameter
-    thrust::device_vector<Edge> dtri_edges(3 * max_triangles);
+        // int max_triangles = 10000; // This line is now a parameter
+        std::cout << "Allocating space for " << max_triangles << " triangles." << std::endl;
+        thrust::device_vector<Edge> dtri_edges(3 * max_triangles);
 
-    int B=128, G=(M+B-1)/B;
-    dottt_kernel<<<G,B>>>(
-        thrust::raw_pointer_cast(deu.data()),
-        thrust::raw_pointer_cast(dev.data()),
-        thrust::raw_pointer_cast(det.data()), M,
-        thrust::raw_pointer_cast(didx.data()),
-        thrust::raw_pointer_cast(dadj.data()),
-        thrust::raw_pointer_cast(dat.data()),
-        delta12, delta13, delta23,
-        thrust::raw_pointer_cast(dres.data()),
-        thrust::raw_pointer_cast(dtri_edges.data())
-    );
-    cudaDeviceSynchronize();
+        std::cout << "Launching kernel..." << std::endl;
+        int B=128, G=(M+B-1)/B;
+        dottt_kernel<<<G,B>>>(
+            thrust::raw_pointer_cast(deu.data()),
+            thrust::raw_pointer_cast(dev.data()),
+            thrust::raw_pointer_cast(det.data()), M,
+            thrust::raw_pointer_cast(didx.data()),
+            thrust::raw_pointer_cast(dadj.data()),
+            thrust::raw_pointer_cast(dat.data()),
+            delta12, delta13, delta23,
+            thrust::raw_pointer_cast(dres.data()),
+            thrust::raw_pointer_cast(dtri_edges.data()),
+            max_triangles
+        );
+        cudaDeviceSynchronize();
 
+        std::cout << "Copying results back..." << std::endl;
+        thrust::host_vector<Edge> htri_edges = dtri_edges;
 
-    thrust::host_vector<Edge> htri_edges = dtri_edges;
+        unsigned long long count = dres[0];
+        size_t triangles_to_print = std::min(max_triangles, (size_t)count);
 
+        for (size_t i = 0; i < triangles_to_print; ++i) {
+            const Edge& e1 = htri_edges[3*i + 0];
+            const Edge& e2 = htri_edges[3*i + 1];
+            const Edge& e3 = htri_edges[3*i + 2];
+            // std::cout << "Triangle #" << i+1 << ":\n";
+            // std::cout << "  Edge: (" << e1.u << " → " << e1.v << ") @ " << e1.t << "\n";
+            // std::cout << "  Edge: (" << e2.u << " → " << e2.v << ") @ " << e2.t << "\n";
+            // std::cout << "  Edge: (" << e3.u << " → " << e3.v << ") @ " << e3.t << "\n";
+        }
 
-    for (unsigned long long i = 0; i < dres[0]; ++i) {
-        const Edge& e1 = htri_edges[3*i + 0];
-        const Edge& e2 = htri_edges[3*i + 1];
-        const Edge& e3 = htri_edges[3*i + 2];
-        std::cout << "Triangle #" << i+1 << ":\n";
-        std::cout << "  Edge: (" << e1.u << " → " << e1.v << ") @ " << e1.t << "\n";
-        std::cout << "  Edge: (" << e2.u << " → " << e2.v << ") @ " << e2.t << "\n";
-        std::cout << "  Edge: (" << e3.u << " → " << e3.v << ") @ " << e3.t << "\n";
+        if (count > max_triangles) {
+            std::cout << "...\n(" << count - max_triangles << " more triangles found but not printed)\n";
+        }
+        return count;
+    } catch (const thrust::system_error& e) {
+        std::cerr << "Thrust/CUDA error: " << e.what() << std::endl;
+        throw;
     }
-    return dres[0];
 }
 
 
@@ -283,8 +449,8 @@ unsigned long long dottt_count(std::vector<Edge>& edges, int n, ts_t delta12, ts
 
 // ---------- Main ----------
 int main(int argc, char* argv[]){
-    if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <filename> <delta12> <delta13> <delta23> <max_triangles_output (optional)>" << std::endl;
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0] << " <filename> <delta12> <delta13> <delta23> [max_triangles_output] [gpu_id]" << std::endl;
         return 1;
     }
 
@@ -292,21 +458,37 @@ int main(int argc, char* argv[]){
     ts_t delta12 = std::stoi(argv[2]);
     ts_t delta13 = std::stoi(argv[3]);
     ts_t delta23 = std::stoi(argv[4]);
-    int max_triangles_output = 10000; // Default value
+    size_t max_triangles_output = 10000; // Default value
     if (argc > 5) {
-        max_triangles_output = std::stoi(argv[5]);
+        max_triangles_output = std::stoull(argv[5]);
     }
 
+    // GPU selection
+    // printGPUInfo();
+    int gpu_id = -1;
+    if (argc > 6) {
+        gpu_id = std::stoi(argv[6]);
+        cudaSetDevice(gpu_id);
+        std::cout << "Using GPU " << gpu_id << " as specified." << std::endl;
+    } else {
+        // gpu_id = selectBestGPU();
+    }
 
     auto ed = load_edges(filename);
     if (ed.max_vid == -1) { // Check if graph loading failed (e.g. file not found)
         std::cerr << "Error loading graph from file: " << filename << std::endl;
         return 1;
     }
+    std::cout << "Graph loaded: " << ed.edges.size() << " edges, " << ed.max_vid + 1 << " vertices." << std::endl;
     int n = ed.max_vid + 1;
 
-    // Pass max_triangles_output to dottt_count
-    auto count = dottt_count(ed.edges, n, delta12, delta13, delta23, max_triangles_output);
-    std::cout << "Temporal triangles (DOTTT, deltas=" << delta12 << "," << delta13 << "," << delta23 << "): " << count << "\n";
+    try {
+        // Pass max_triangles_output to dottt_count
+        auto count = dottt_count(ed.edges, n, delta12, delta13, delta23, max_triangles_output);
+        std::cout << "Temporal triangles (DOTTT, deltas=" << delta12 << "," << delta13 << "," << delta23 << "): " << count << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }
